@@ -76,6 +76,19 @@ STABLECOINS = {
     "USDP", "GUSD", "PYUSD", "USDE",
 }
 
+# Tokens to exclude from market universe (leveraged tokens, fiat-pegged variants,
+# and other instruments that aren't suitable as portfolio alternatives)
+BLACKLIST = {
+    # Leveraged tokens (Binance suffix patterns)
+    "BTCUP", "BTCDOWN", "ETHUP", "ETHDOWN", "BNBUP", "BNBDOWN",
+    "ADAUP", "ADADOWN", "LINKUP", "LINKDOWN", "DOTUP", "DOTDOWN",
+    "SOLUP", "SOLDOWN", "AVAXUP", "AVAXDOWN", "MATICUP", "MATICDOWN",
+    # Wrapped/synthetic versions
+    "WBTC", "WETH", "STETH", "WSTETH", "RETH", "CBETH", "WBETH",
+    # Other excluded
+    "PAXG", "XAUT",  # tokenized gold (different asset class)
+}
+
 SECTOR_MAP = {
     "BTC": "L1", "ETH": "L1", "SOL": "L1", "BNB": "L1", "XRP": "L1",
     "ADA": "L1", "AVAX": "L1", "TRX": "L1", "DOT": "L1", "ATOM": "L1",
@@ -1797,13 +1810,13 @@ async def cmd_analyze(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    price  = ta.get("price_usd", 0)
+    price  = ta.get("last_price") or ta.get("price_usd", 0) or 0
     rsi    = ta.get("rsi") or 0
     trend  = ta.get("trend", "Unknown")
-    ema20  = ta.get("ema20", 0)
-    ema50  = ta.get("ema50", 0)
-    ema200 = ta.get("ema200", 0)
-    atr    = ta.get("atr", 0)
+    ema20  = ta.get("ema20", 0) or 0
+    ema50  = ta.get("ema50", 0) or 0
+    ema200 = ta.get("ema200", 0) or 0
+    atr    = ta.get("atr", 0) or 0
 
     lines = [
         f"🔬 *تحليل {symbol}*",
