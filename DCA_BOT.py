@@ -238,10 +238,26 @@ def binance_get_my_trades(symbol: str, from_id: int = 0,
 
 def binance_get_klines(symbol: str, interval: str = "1h",
                        limit: int = 200) -> Optional[List[List]]:
+    """
+    Fetch klines with 2-tier fallback:
+    1. Binance Spot (api.binance.com) — for spot-listed coins
+    2. Binance Futures (fapi.binance.com) — for futures-only coins (HYPE, etc.)
+    """
+    # Tier 1: Spot
     data = safe_request("GET", f"{BINANCE_BASE}/api/v3/klines",
                         params={"symbol": symbol, "interval": interval,
                                 "limit": limit})
-    return data if isinstance(data, list) else None
+    if isinstance(data, list) and len(data) > 0:
+        return data
+
+    # Tier 2: Futures fallback
+    data = safe_request("GET", "https://fapi.binance.com/fapi/v1/klines",
+                        params={"symbol": symbol, "interval": interval,
+                                "limit": limit})
+    if isinstance(data, list) and len(data) > 0:
+        return data
+
+    return None
 
 
 def fetch_binance_portfolio() -> Tuple[List[Dict], Optional[str]]:
