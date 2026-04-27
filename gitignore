@@ -1,0 +1,23 @@
+# Sensitive files (NEVER commit)
+.env
+.env.*
+*.key
+*.pem
+
+# Local data (might contain wallet info)
+data/
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
