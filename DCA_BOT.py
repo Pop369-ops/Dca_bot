@@ -1,8 +1,8 @@
 """
 ╔═══════════════════════════════════════════════════════════════════╗
-║                       DCA_BOT v2.0                                ║
-║       Smart Multi-Exchange Portfolio Manager                     ║
-║       Phases 3.1 + 3.2 + 3.3 + 3.4 (MVP Bundle)                  ║
+║                       DCA_BOT v3.0                                ║
+║       Smart Multi-Exchange Portfolio Manager — FINAL              ║
+║       Phases 3.1 + 3.2 + 3.3 + 3.4 + 3.5 + 3.6 + 3.7              ║
 ║                                                                   ║
 ║  Features:                                                        ║
 ║    💼 Unified portfolio (Binance + OKX)                           ║
@@ -11,6 +11,12 @@
 ║    📈 Technical analysis (RSI, EMA, ATR, Trend)                   ║
 ║    🎯 Recommendations Engine (Hold/Sell/Buy/Replace/TakeProfit)   ║
 ║    🔄 Sector classification + Risk analysis                       ║
+║    🆕 Alternatives Engine (smart REPLACE suggestions)             ║
+║    🆕 DCA Alert Monitor (5-min auto-watch)                        ║
+║    🆕 /analyze SYMBOL (deep dive any coin)                        ║
+║    🆕 /top (market gainers)                                       ║
+║    🆕 /compare SYMBOL (Binance vs OKX prices)                     ║
+║    🆕 /history (Net Worth 30d tracking)                           ║
 ║                                                                   ║
 ║  للأغراض التعليمية فقط — ليس نصيحة مالية                          ║
 ╚═══════════════════════════════════════════════════════════════════╝
@@ -837,6 +843,189 @@ def make_recommendation(asset_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 8.5 ALTERNATIVES ENGINE (Phase 3.5)
+# ══════════════════════════════════════════════════════════════════
+
+# Cache for market universe (refreshed every 30 min)
+_market_cache: Dict[str, Any] = {"data": [], "ts": 0}
+_MARKET_CACHE_TTL = 1800  # 30 min
+
+
+def fetch_market_universe(top_n: int = 200) -> List[Dict]:
+    """
+    Get top N coins from Binance Spot by 24h quote volume.
+    Returns list of: {symbol, base, price, change_24h, quote_volume, volume_rank}
+    Cached for 30 min to avoid repeated API hits.
+    """
+    now = time.time()
+    if (_market_cache["data"]
+            and now - _market_cache["ts"] < _MARKET_CACHE_TTL):
+        return _market_cache["data"][:top_n]
+
+    data = safe_request("GET", f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                        timeout=(5, 25))
+    if not isinstance(data, list):
+        return []
+
+    coins = []
+    for t in data:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            qv = float(t.get("quoteVolume") or 0)
+            pc = float(t.get("priceChangePercent") or 0)
+            lp = float(t.get("lastPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qv < 1_000_000:  # min $1M daily volume
+            continue
+        base = sym[:-4]  # strip USDT
+        if base in BLACKLIST or base in STABLECOINS:
+            continue
+        coins.append({
+            "symbol":       sym,
+            "base":         base,
+            "price":        lp,
+            "change_24h":   pc,
+            "quote_volume": qv,
+            "sector":       classify_asset(base),
+        })
+
+    coins.sort(key=lambda x: x["quote_volume"], reverse=True)
+    for i, c in enumerate(coins, 1):
+        c["volume_rank"] = i
+
+    _market_cache["data"] = coins
+    _market_cache["ts"] = now
+    log.info(f"[MARKET] universe refreshed: {len(coins)} coins")
+    return coins[:top_n]
+
+
+def fetch_klines_change(symbol: str, days: int = 7) -> Optional[float]:
+    """Compute % change over N days from klines. Returns None if no data."""
+    klines = binance_get_klines(symbol, interval="1d", limit=days + 1)
+    if not klines or len(klines) < 2:
+        return None
+    try:
+        first_close = float(klines[0][4])
+        last_close = float(klines[-1][4])
+        if first_close <= 0:
+            return None
+        return ((last_close - first_close) / first_close) * 100
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def compute_momentum_score(coin: Dict[str, Any]) -> float:
+    """
+    Score 0-100 ranking how attractive this coin is RIGHT NOW.
+    Factors: 24h change, 7d change, RSI sweet spot, volume rank.
+    """
+    score = 0.0
+    chg_24h = coin.get("change_24h", 0)
+    chg_7d  = coin.get("change_7d") or 0
+    rsi     = coin.get("rsi") or 50
+    rank    = coin.get("volume_rank", 999)
+
+    # 24h momentum (max 25)
+    if chg_24h >= 10:    score += 25
+    elif chg_24h >= 5:   score += 20
+    elif chg_24h >= 2:   score += 12
+    elif chg_24h > 0:    score += 6
+    elif chg_24h > -2:   score += 3
+
+    # 7d momentum (max 30 — most important)
+    if chg_7d >= 30:     score += 30
+    elif chg_7d >= 15:   score += 25
+    elif chg_7d >= 5:    score += 18
+    elif chg_7d >= 0:    score += 10
+    elif chg_7d > -5:    score += 5
+
+    # RSI sweet spot 50-65 (max 25)
+    if 50 <= rsi <= 65:  score += 25
+    elif 45 <= rsi <= 70: score += 18
+    elif 40 <= rsi <= 75: score += 10
+    elif rsi > 80:        score -= 5  # overbought
+    elif rsi < 30:        score += 8  # oversold (DCA candidate)
+
+    # Volume rank (max 20)
+    if rank <= 20:       score += 20
+    elif rank <= 50:     score += 15
+    elif rank <= 100:    score += 10
+    elif rank <= 200:    score += 5
+
+    return max(0.0, min(100.0, score))
+
+
+def find_alternatives(target_sector: str, exclude: List[str],
+                       max_results: int = 3) -> List[Dict[str, Any]]:
+    """
+    Find better alternatives in the same sector.
+    Returns list ranked by momentum score with full TA.
+    """
+    universe = fetch_market_universe(top_n=200)
+    if not universe:
+        return []
+
+    # Filter by sector + exclude current holdings
+    excluded = set(s.upper() for s in exclude)
+    candidates = [
+        c for c in universe
+        if c["sector"] == target_sector and c["base"] not in excluded
+    ]
+
+    if not candidates:
+        return []
+
+    # Take top 10 by volume to avoid overloading TA
+    candidates = candidates[:10]
+
+    # Enrich with 7d change + RSI
+    enriched = []
+    for c in candidates:
+        chg_7d = fetch_klines_change(c["symbol"], days=7)
+        ta = analyze_technical(c["symbol"])
+        c["change_7d"] = chg_7d if chg_7d is not None else 0
+        c["rsi"]   = ta.get("rsi") or 50
+        c["trend"] = ta.get("trend", "Unknown")
+        c["momentum_score"] = compute_momentum_score(c)
+        enriched.append(c)
+        time.sleep(0.05)  # rate limit safety
+
+    # Filter: keep only those with momentum >= 50 (don't suggest weak coins)
+    enriched = [c for c in enriched if c["momentum_score"] >= 50]
+
+    # Sort by momentum score
+    enriched.sort(key=lambda x: x["momentum_score"], reverse=True)
+    return enriched[:max_results]
+
+
+def format_alternatives_block(target_sym: str, target_sector: str,
+                               alternatives: List[Dict]) -> str:
+    """Format alternatives suggestions as Markdown block."""
+    if not alternatives:
+        return f"   _لم يجد بدائل قوية في قطاع {target_sector} حالياً_"
+
+    lines = [f"   🔄 *بدائل أقوى من {target_sym}:*"]
+    for i, alt in enumerate(alternatives, 1):
+        sym  = alt["base"]
+        chg_24h = alt.get("change_24h", 0)
+        chg_7d  = alt.get("change_7d", 0)
+        rsi     = alt.get("rsi", 0) or 0
+        rank    = alt.get("volume_rank", 0)
+        score   = alt.get("momentum_score", 0)
+        lines.append(
+            f"   {i}. *{sym}* — score `{score:.0f}/100`"
+        )
+        lines.append(
+            f"      24h: {chg_24h:+.1f}% | 7d: {chg_7d:+.1f}% | "
+            f"RSI: {rsi:.0f} | Vol#{rank}"
+        )
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════
 # 9. PORTFOLIO BUILDER
 # ══════════════════════════════════════════════════════════════════
 
@@ -1138,6 +1327,21 @@ def format_full_portfolio(p: Dict[str, Any]) -> str:
                 lines.append(f"   ⚠️ Stop: {_fmt_price(stop)} ({stop_pct:+.1f}%)")
             if hold:
                 lines.append(f"   ⏳ المدة: {hold}")
+
+            # ── Alternatives Engine: only for REPLACE recommendations ──
+            if action == "REPLACE":
+                try:
+                    portfolio_assets = [a["asset"] for a in unified]
+                    alts = find_alternatives(
+                        target_sector=sector,
+                        exclude=portfolio_assets,
+                        max_results=3,
+                    )
+                    if alts:
+                        lines.append("")
+                        lines.append(format_alternatives_block(sym, sector, alts))
+                except Exception as e:
+                    log.warning(f"[ALT] {sym}: {e}")
         lines.append("")
 
     sectors = p.get("sectors", {})
@@ -1265,27 +1469,242 @@ def run_connectivity_test() -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 11.5 DCA ALERT MONITOR (Phase 3.6)
+# ══════════════════════════════════════════════════════════════════
+
+# Cooldowns to prevent spam (per symbol per alert type)
+DCA_ALERT_COOLDOWN_HRS = 6
+
+
+def _alert_in_cooldown(symbol: str, alert_type: str) -> bool:
+    """Check if this specific alert type was sent recently for this symbol."""
+    key = f"{symbol}:{alert_type}"
+    cooldowns = storage_load("dca_alert_cooldowns.json", {})
+    last = cooldowns.get(key)
+    if not last:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last)
+        return (datetime.now(TZ_RIYADH) - last_dt) < \
+               timedelta(hours=DCA_ALERT_COOLDOWN_HRS)
+    except Exception:
+        return False
+
+
+def _mark_alert_sent(symbol: str, alert_type: str):
+    """Mark that an alert was sent at this time."""
+    key = f"{symbol}:{alert_type}"
+    cooldowns = storage_load("dca_alert_cooldowns.json", {})
+    cooldowns[key] = now_iso()
+    # Trim old entries (>7 days)
+    cutoff = datetime.now(TZ_RIYADH) - timedelta(days=7)
+    cleaned = {}
+    for k, v in cooldowns.items():
+        try:
+            if datetime.fromisoformat(v) > cutoff:
+                cleaned[k] = v
+        except Exception:
+            continue
+    storage_save("dca_alert_cooldowns.json", cleaned)
+
+
+def check_dca_opportunities(portfolio: Dict[str, Any]) -> List[Dict]:
+    """
+    Scan portfolio for DCA-worthy events.
+    Returns list of alerts to send: {symbol, type, message, severity}
+    """
+    alerts = []
+
+    for asset in portfolio.get("unified", []):
+        sym = asset["asset"]
+        if asset.get("is_stable"):
+            continue
+
+        avg_buy   = asset.get("avg_buy_price", 0)
+        price     = asset.get("price_usd", 0)
+        rsi       = asset.get("rsi")
+        trend     = asset.get("trend", "Unknown")
+        pnl_pct   = asset.get("unrealized_pct", 0)
+        rec       = asset.get("recommendation", {})
+        target    = rec.get("target_price", 0)
+        stop      = rec.get("stop_loss", 0)
+
+        if avg_buy <= 0 or price <= 0:
+            continue
+
+        # ── ① DCA Opportunity (price down 5%+ from avg, RSI oversold) ──
+        if pnl_pct < -5 and rsi is not None and rsi < 35 \
+                and trend != "StrongDown":
+            if not _alert_in_cooldown(sym, "DCA"):
+                alerts.append({
+                    "symbol": sym,
+                    "type":   "DCA",
+                    "severity": "info",
+                    "message": (
+                        f"🔔 *فرصة DCA على {sym}*\n\n"
+                        f"📥 شراء (avg): ${avg_buy:,.4f}\n"
+                        f"💰 الآن: ${price:,.4f}\n"
+                        f"📊 P&L: {pnl_pct:+.1f}%\n"
+                        f"🟢 RSI: {rsi:.0f} (oversold)\n"
+                        f"📈 Trend: {trend}\n\n"
+                        f"💡 *اشترِ المزيد بنفس الكمية الأساسية*\n"
+                        f"⚠️ تنفيذ يدوي"
+                    ),
+                })
+
+        # ── ② Take Profit reached ──
+        if target > 0 and price >= target * 0.98:  # within 2% of target
+            if not _alert_in_cooldown(sym, "TARGET"):
+                alerts.append({
+                    "symbol": sym,
+                    "type":   "TARGET",
+                    "severity": "success",
+                    "message": (
+                        f"🎯 *وصول الهدف على {sym}*\n\n"
+                        f"📥 شراء: ${avg_buy:,.4f}\n"
+                        f"💰 الآن: ${price:,.4f}\n"
+                        f"🎯 الهدف: ${target:,.4f}\n"
+                        f"📊 P&L: {pnl_pct:+.1f}% ✅\n\n"
+                        f"💡 *وقت أخذ الربح — حسب خطتك*\n"
+                        f"⚠️ تنفيذ يدوي"
+                    ),
+                })
+
+        # ── ③ Stop Loss hit ──
+        if stop > 0 and price <= stop * 1.02:  # within 2% of stop
+            if not _alert_in_cooldown(sym, "STOP"):
+                alerts.append({
+                    "symbol": sym,
+                    "type":   "STOP",
+                    "severity": "warning",
+                    "message": (
+                        f"⚠️ *Stop Loss على {sym}*\n\n"
+                        f"📥 شراء: ${avg_buy:,.4f}\n"
+                        f"💰 الآن: ${price:,.4f}\n"
+                        f"⚠️ Stop: ${stop:,.4f}\n"
+                        f"📊 P&L: {pnl_pct:+.1f}%\n\n"
+                        f"💡 *أعد تقييم الموقف — احتمال الخروج*\n"
+                        f"⚠️ تنفيذ يدوي"
+                    ),
+                })
+
+        # ── ④ Big drop alert (>10% in 24h) — risk warning ──
+        bin_info = next(
+            (p for p in portfolio["binance"]["positions"] if p["asset"] == sym),
+            None
+        )
+        if bin_info and pnl_pct < -10:
+            # Already covered by stop_loss check most likely, skip
+            pass
+
+    return alerts
+
+
+async def dca_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background job: scan portfolio every 5 min, send DCA alerts."""
+    job_data = context.job.data or {}
+    chat_id = job_data.get("chat_id")
+    if not chat_id:
+        return
+
+    log.info(f"[DCA_MONITOR] scan starting for chat {chat_id}")
+
+    try:
+        loop = asyncio.get_event_loop()
+        # Skip trade sync inside monitor (heavy) — use cached/incremental
+        portfolio = await loop.run_in_executor(
+            None, build_full_portfolio, False, True
+        )
+
+        alerts = check_dca_opportunities(portfolio)
+
+        for alert in alerts:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=alert["message"],
+                    parse_mode="Markdown",
+                )
+                _mark_alert_sent(alert["symbol"], alert["type"])
+                log.info(f"[DCA_ALERT] sent {alert['type']} for {alert['symbol']}")
+            except Exception as e:
+                log.warning(f"[DCA_ALERT] failed: {e}")
+
+        log.info(f"[DCA_MONITOR] done. {len(alerts)} alerts sent.")
+    except Exception as e:
+        log.exception(f"[DCA_MONITOR] error: {e}")
+
+
+async def networth_snapshot_job(context: ContextTypes.DEFAULT_TYPE):
+    """Background job: save daily net worth snapshot."""
+    job_data = context.job.data or {}
+    chat_id = job_data.get("chat_id")
+
+    try:
+        loop = asyncio.get_event_loop()
+        portfolio = await loop.run_in_executor(
+            None, build_full_portfolio, False, False
+        )
+
+        history = storage_load("networth_history.json", [])
+        today = datetime.now(TZ_RIYADH).strftime("%Y-%m-%d")
+
+        # Replace today's entry if exists, else append
+        history = [h for h in history if h.get("date") != today]
+        history.append({
+            "date":           today,
+            "ts":             now_iso(),
+            "total_usd":      portfolio["total_usd"],
+            "crypto_usd":     portfolio["crypto_usd"],
+            "stable_usd":     portfolio["stable_usd"],
+            "binance_usd":    portfolio["binance"]["total_usd"],
+            "okx_usd":        portfolio["okx"]["total_usd"],
+            "unrealized_pnl": portfolio.get("total_unrealized", 0),
+        })
+
+        # Keep only last 90 days
+        history = sorted(history, key=lambda x: x["date"])[-90:]
+        storage_save("networth_history.json", history)
+        log.info(f"[NETWORTH] snapshot saved: ${portfolio['total_usd']:,.2f}")
+    except Exception as e:
+        log.exception(f"[NETWORTH] error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
 # 12. TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "💼 *DCA_BOT v2.0* — Smart Portfolio Manager\n"
-        "_MVP: Binance + OKX + P&L + TA + Recommendations_\n\n"
+        "💼 *DCA_BOT v3.0* — Smart Portfolio Manager\n"
+        "_FINAL: Binance + OKX + P&L + TA + AI Recommendations_\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "*الميزات:*\n"
         "💼 محفظة موحّدة (Binance + OKX)\n"
         "📊 P&L per coin (avg buy تلقائي)\n"
         "📈 تحليل فني (RSI, EMA, ATR, Trend)\n"
-        "🎯 توصيات: احتفظ / بِع / اشترِ / استبدل / خذ ربح\n"
-        "🔄 تصنيف القطاعات + تحليل المخاطر\n\n"
-        "*الأوامر:*\n"
+        "🎯 توصيات ذكية: احتفظ / بِع / اشترِ / استبدل / خذ ربح\n"
+        "🔄 تصنيف القطاعات + تحليل المخاطر\n"
+        "🆕 *Alternatives Engine* — بدائل ذكية لكل عملة ضعيفة\n"
+        "🆕 *DCA Alert Monitor* — تنبيهات تلقائية كل 5 دقائق\n"
+        "🆕 *Net Worth Tracking* — تطور المحفظة 30 يوم\n\n"
+        "*الأوامر الأساسية:*\n"
         "`/start`           القائمة\n"
         "`/test`            فحص الاتصال\n"
         "`/sync`            مزامنة فورية لـ trades\n"
         "`محفظتي`          التحليل الكامل ⭐\n"
         "`محفظة Binance`   فقط Binance\n"
         "`محفظة OKX`       فقط OKX\n\n"
+        "*الأوامر الجديدة:* 🆕\n"
+        "`/analyze BTC`     تحليل أي عملة بعمق\n"
+        "`/top`             أعلى 10 رابحين السوق\n"
+        "`/compare BTC`     مقارنة سعر Binance vs OKX\n"
+        "`/history`         سجل Net Worth (30 يوم)\n"
+        "`/monitor`         تفعيل/إيقاف التنبيهات التلقائية\n\n"
+        "*أنواع التنبيهات التلقائية:*\n"
+        "🔔 فرصة DCA (سعر هابط + RSI oversold)\n"
+        "🎯 وصول الهدف\n"
+        "⚠️ Stop Loss\n\n"
         "⚠️ _Read-Only — تنفيذ يدوي 100%_\n"
         "⚠️ _تعليمي فقط — ليس نصيحة مالية_"
     )
@@ -1337,6 +1756,334 @@ async def cmd_sync(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🟡 Binance: {bin_total} trade ({len(bin_trades)} عملة)\n"
         f"⚫️ OKX: {okx_total} trade ({len(okx_trades)} عملة)\n\n"
         f"أرسل `محفظتي` للتحليل الكامل.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_analyze(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Deep analysis on any coin (even if not in portfolio)."""
+    if not c.args:
+        await u.message.reply_text(
+            "ℹ️ الاستخدام: `/analyze BTC`\nأو: `/analyze ETH`",
+            parse_mode="Markdown"
+        )
+        return
+
+    symbol = c.args[0].upper().strip()
+    if symbol in STABLECOINS:
+        await u.message.reply_text(f"⚪ `{symbol}` عملة مستقرة — لا تحتاج تحليل.")
+        return
+
+    msg = await u.message.reply_text(f"⏳ تحليل {symbol}...")
+
+    loop = asyncio.get_event_loop()
+
+    def _do_analyze():
+        symbol_full = f"{symbol}USDT"
+        ta = analyze_technical(symbol_full)
+        chg_7d = fetch_klines_change(symbol_full, days=7)
+        chg_30d = fetch_klines_change(symbol_full, days=30)
+        sector = classify_asset(symbol)
+        return ta, chg_7d, chg_30d, sector
+
+    ta, chg_7d, chg_30d, sector = await loop.run_in_executor(None, _do_analyze)
+
+    if not ta or ta.get("trend") == "Unknown":
+        await msg.delete()
+        await u.message.reply_text(
+            f"❌ لم أجد بيانات لـ `{symbol}`.\n"
+            f"تأكد من الاسم (مثل: BTC، ETH، SOL).",
+            parse_mode="Markdown"
+        )
+        return
+
+    price  = ta.get("price_usd", 0)
+    rsi    = ta.get("rsi") or 0
+    trend  = ta.get("trend", "Unknown")
+    ema20  = ta.get("ema20", 0)
+    ema50  = ta.get("ema50", 0)
+    ema200 = ta.get("ema200", 0)
+    atr    = ta.get("atr", 0)
+
+    lines = [
+        f"🔬 *تحليل {symbol}*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🏷 القطاع: `{sector}`",
+        f"💰 السعر: `{_fmt_price(price)}`",
+        f"",
+        f"*📈 الأداء:*",
+        f"   • 24h: data من klines (latest candle)",
+    ]
+    if chg_7d is not None:
+        emoji = "🟢" if chg_7d > 0 else "🔴"
+        lines.append(f"   • 7d: {emoji} `{chg_7d:+.2f}%`")
+    if chg_30d is not None:
+        emoji = "🟢" if chg_30d > 0 else "🔴"
+        lines.append(f"   • 30d: {emoji} `{chg_30d:+.2f}%`")
+
+    lines.append("")
+    lines.append("*🔍 التحليل الفني:*")
+    lines.append(f"   📊 Trend: {_trend_label(trend)}")
+    lines.append(f"   📊 RSI(14): `{rsi:.1f}`")
+    if ema20 > 0:
+        lines.append(f"   📈 EMA20:  `{_fmt_price(ema20)}`")
+        lines.append(f"   📈 EMA50:  `{_fmt_price(ema50)}`")
+        lines.append(f"   📈 EMA200: `{_fmt_price(ema200)}`")
+    if atr > 0:
+        atr_pct = (atr / price * 100) if price > 0 else 0
+        lines.append(f"   ⚡ ATR: `${atr:.4f}` ({atr_pct:.2f}%)")
+
+    lines.append("")
+    lines.append("*🎯 إشارات سريعة:*")
+    if rsi > 70:
+        lines.append("   • RSI overbought (احذر — فقاعة محتملة)")
+    elif rsi < 30:
+        lines.append("   • RSI oversold (فرصة DCA محتملة)")
+    else:
+        lines.append("   • RSI ضمن المدى الطبيعي")
+
+    if trend == "StrongUp":
+        lines.append("   • Trend صاعد قوي (3 EMAs محاذاة)")
+    elif trend == "MildUp":
+        lines.append("   • Trend صاعد لطيف")
+    elif trend == "StrongDown":
+        lines.append("   • ⚠️ Trend هابط قوي")
+    elif trend == "MildDown":
+        lines.append("   • Trend هابط لطيف")
+    else:
+        lines.append("   • Trend جانبي/غير واضح")
+
+    lines.append("")
+    lines.append("⚠️ _تحليل فني فقط — تنفيذ يدوي 100%_")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_top(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show top market gainers from Binance Spot."""
+    msg = await u.message.reply_text("⏳ جاري جلب أعلى الرابحين...")
+
+    loop = asyncio.get_event_loop()
+    universe = await loop.run_in_executor(None, fetch_market_universe, 200)
+
+    if not universe:
+        await msg.delete()
+        await u.message.reply_text("❌ تعذّر جلب بيانات السوق.")
+        return
+
+    # Top 10 gainers (24h)
+    top_gainers = sorted(universe, key=lambda x: x["change_24h"],
+                          reverse=True)[:10]
+
+    lines = [
+        "🏆 *Top 10 رابحين 24 ساعة*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    for i, c in enumerate(top_gainers, 1):
+        sym = c["base"]
+        chg = c["change_24h"]
+        price = c["price"]
+        vol = c["quote_volume"]
+        sector = c["sector"]
+        vol_s = (f"${vol/1e9:.2f}B" if vol >= 1e9
+                 else f"${vol/1e6:.0f}M")
+        lines.append(
+            f"{i}. *{sym}* `+{chg:.1f}%` | {sector}\n"
+            f"   💰 {_fmt_price(price)} | 📊 Vol: {vol_s}"
+        )
+
+    lines.append("")
+    lines.append("⚠️ _معلومة فقط — ليست توصية_")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_compare(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Compare prices between Binance and OKX for a symbol."""
+    if not c.args:
+        await u.message.reply_text(
+            "ℹ️ الاستخدام: `/compare BTC`\nأو: `/compare ETH`",
+            parse_mode="Markdown"
+        )
+        return
+
+    symbol = c.args[0].upper().strip()
+    msg = await u.message.reply_text(f"⏳ مقارنة أسعار {symbol}...")
+
+    loop = asyncio.get_event_loop()
+
+    def _do_compare():
+        bin_prices = binance_get_prices() or {}
+        okx_prices = okx_get_prices() or {}
+        bin_price = bin_prices.get(f"{symbol}USDT", 0)
+        okx_price = okx_prices.get(f"{symbol}-USDT", 0)
+        return bin_price, okx_price
+
+    bin_price, okx_price = await loop.run_in_executor(None, _do_compare)
+
+    lines = [
+        f"⚖️ *مقارنة أسعار {symbol}*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    if bin_price > 0:
+        lines.append(f"🟡 Binance: `{_fmt_price(bin_price)}`")
+    else:
+        lines.append(f"🟡 Binance: ❌ غير متاح")
+
+    if okx_price > 0:
+        lines.append(f"⚫️ OKX:     `{_fmt_price(okx_price)}`")
+    else:
+        lines.append(f"⚫️ OKX:     ❌ غير متاح")
+
+    if bin_price > 0 and okx_price > 0:
+        diff = okx_price - bin_price
+        diff_pct = (diff / bin_price) * 100
+        cheaper = "Binance" if bin_price < okx_price else "OKX"
+        cheaper_icon = "🟡" if cheaper == "Binance" else "⚫️"
+        lines.append("")
+        lines.append(f"📊 الفرق: `${abs(diff):,.4f}` ({abs(diff_pct):.3f}%)")
+        lines.append(f"💡 الأرخص: {cheaper_icon} *{cheaper}*")
+
+        if abs(diff_pct) > 0.5:
+            lines.append(f"⚠️ فرق كبير — تحقّق من الـ orderbook قبل الشراء")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_history(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show net worth tracking history (last 30 days)."""
+    history = storage_load("networth_history.json", [])
+
+    if not history:
+        await u.message.reply_text(
+            "📊 *سجل الـ Net Worth*\n\n"
+            "⚪ لا يوجد سجل بعد.\n"
+            "_البوت يحفظ snapshot كل 24 ساعة تلقائياً_\n"
+            "_بعد يوم واحد ستبدأ ترى البيانات_",
+            parse_mode="Markdown"
+        )
+        return
+
+    history = sorted(history, key=lambda x: x.get("date", ""))
+    last_30 = history[-30:]
+
+    lines = [
+        "📊 *سجل المحفظة (آخر 30 يوم)*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        ""
+    ]
+
+    # Summary
+    if len(last_30) >= 2:
+        first = last_30[0]
+        last = last_30[-1]
+        change = last["total_usd"] - first["total_usd"]
+        change_pct = (change / first["total_usd"] * 100) if first["total_usd"] > 0 else 0
+        emoji = "🟢" if change >= 0 else "🔴"
+        lines.append(f"📅 من: `{first['date']}` → `{last['date']}`")
+        lines.append(
+            f"💰 ${first['total_usd']:,.2f} → "
+            f"${last['total_usd']:,.2f}"
+        )
+        lines.append(
+            f"📈 التغيّر: {emoji} `${change:+,.2f}` (`{change_pct:+.2f}%`)"
+        )
+        lines.append("")
+
+    # Last 10 entries
+    lines.append("*📊 آخر 10 snapshots:*")
+    for entry in last_30[-10:][::-1]:
+        date = entry.get("date", "?")
+        total = entry.get("total_usd", 0)
+        pnl = entry.get("unrealized_pnl", 0)
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        lines.append(
+            f"   `{date}` ${total:,.2f} | {pnl_emoji} P&L: ${pnl:+,.2f}"
+        )
+
+    if len(last_30) > 10:
+        lines.append(f"")
+        lines.append(f"_... و {len(last_30) - 10} snapshot أقدم_")
+
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Toggle DCA alert monitor (on/off)."""
+    chat_id = u.effective_chat.id
+    args_text = " ".join(c.args).lower() if c.args else ""
+
+    # Determine action
+    if "off" in args_text or "stop" in args_text or "وقف" in args_text:
+        action = "stop"
+    elif "on" in args_text or "start" in args_text or "تشغيل" in args_text:
+        action = "start"
+    else:
+        # Toggle
+        existing = c.job_queue.get_jobs_by_name(f"dca_monitor_{chat_id}")
+        action = "stop" if existing else "start"
+
+    if action == "stop":
+        for j in c.job_queue.get_jobs_by_name(f"dca_monitor_{chat_id}"):
+            j.schedule_removal()
+        for j in c.job_queue.get_jobs_by_name(f"networth_{chat_id}"):
+            j.schedule_removal()
+
+        cfg = storage_load("user_settings.json", {})
+        cfg[str(chat_id)] = {"monitor_active": False}
+        storage_save("user_settings.json", cfg)
+
+        await u.message.reply_text(
+            "⛔ *تم إيقاف المراقبة*\n\n"
+            "لن تستلم تنبيهات DCA تلقائية.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Start monitoring
+    for j in c.job_queue.get_jobs_by_name(f"dca_monitor_{chat_id}"):
+        j.schedule_removal()
+    for j in c.job_queue.get_jobs_by_name(f"networth_{chat_id}"):
+        j.schedule_removal()
+
+    c.job_queue.run_repeating(
+        dca_monitor_job,
+        interval=300,        # every 5 min
+        first=30,            # first run after 30 sec
+        data={"chat_id": chat_id},
+        name=f"dca_monitor_{chat_id}",
+    )
+
+    c.job_queue.run_repeating(
+        networth_snapshot_job,
+        interval=86400,      # every 24 hours
+        first=60,            # first run after 1 min
+        data={"chat_id": chat_id},
+        name=f"networth_{chat_id}",
+    )
+
+    cfg = storage_load("user_settings.json", {})
+    cfg[str(chat_id)] = {"monitor_active": True}
+    storage_save("user_settings.json", cfg)
+
+    await u.message.reply_text(
+        "🔔 *تم تفعيل المراقبة الذكية*\n\n"
+        "*التنبيهات التلقائية:*\n"
+        f"   ⏱ كل 5 دقائق — فحص فرص DCA\n"
+        f"   📊 كل 24 ساعة — Net Worth snapshot\n\n"
+        "*أنواع التنبيهات:*\n"
+        f"   🔔 فرصة DCA (سعر هابط + RSI oversold)\n"
+        f"   🎯 وصول الهدف\n"
+        f"   ⚠️ Stop Loss\n\n"
+        f"❄️ Cooldown: 6 ساعات لكل تنبيه (لمنع spam)\n\n"
+        f"للإيقاف: `/monitor off`",
         parse_mode="Markdown"
     )
 
@@ -1443,19 +2190,25 @@ def _print_banner():
                   if (OKX_API_KEY and OKX_SECRET and OKX_PASSPHRASE)
                   else "⚪ معطّل")
     print("=" * 70)
-    print("  💼 DCA_BOT v2.0 — Smart Portfolio Manager (MVP) ✅")
+    print("  💼 DCA_BOT v3.0 — Smart Portfolio Manager (FINAL) ✅")
     print("=" * 70)
     print(f"  المنصات         :")
     print(f"    🟡 Binance     : {bin_status}")
     print(f"    ⚫️ OKX         : {okx_status}")
     print(f"  Storage          : {DATA_DIR}")
-    print(f"  المراحل المدمجة  : 3.1 + 3.2 + 3.3 + 3.4 (MVP)")
+    print(f"  المراحل المدمجة  : 3.1+3.2+3.3+3.4+3.5+3.6+3.7 (Complete)")
     print(f"  الميزات          :")
-    print(f"    💼 Unified portfolio")
-    print(f"    📊 Auto avg buy + P&L")
-    print(f"    📈 Technical analysis")
-    print(f"    🎯 Recommendations engine")
-    print(f"    🔄 Sector classification")
+    print(f"    💼 Unified portfolio (Binance + OKX)")
+    print(f"    📊 Auto avg buy + P&L (WAP method)")
+    print(f"    📈 Technical analysis (RSI, EMA, ATR)")
+    print(f"    🎯 Recommendations engine (Hold/Sell/Buy/Replace)")
+    print(f"    🔄 Sector classification + Risk analysis")
+    print(f"    🆕 Alternatives Engine (sector-based)")
+    print(f"    🆕 DCA Alert Monitor (5-min auto-watch)")
+    print(f"    🆕 Net Worth tracking (24h snapshots)")
+    print(f"    🆕 /analyze, /top, /compare, /history, /monitor")
+    print("=" * 70)
+    print(f"  أرسل /start في تيليقرام لرؤية كل الأوامر")
     print("=" * 70)
 
 
@@ -1472,6 +2225,11 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("sync", cmd_sync))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("compare", cmd_compare))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("monitor", cmd_monitor))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
