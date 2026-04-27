@@ -944,6 +944,222 @@ async def cmd_test(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_bindebug(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Deep diagnostic for Binance — 4 isolated tests to find root cause."""
+    msg = await u.message.reply_text("⏳ تشخيص Binance بـ4 اختبارات...")
+
+    loop = asyncio.get_event_loop()
+
+    def _run_tests() -> Dict[str, Any]:
+        results = {}
+
+        # ── Test 1: Public ping (no auth — tests connectivity only) ──
+        t1_start = time.time()
+        try:
+            r = requests.get(f"{BINANCE_BASE}/api/v3/ping", timeout=10)
+            results["test1"] = {
+                "name": "Public ping (لا auth)",
+                "ok":   r.status_code == 200,
+                "status": r.status_code,
+                "elapsed_ms": int((time.time() - t1_start) * 1000),
+                "body": (r.text or "")[:100],
+            }
+        except Exception as e:
+            results["test1"] = {
+                "name": "Public ping (لا auth)",
+                "ok":   False,
+                "status": "EXCEPTION",
+                "elapsed_ms": int((time.time() - t1_start) * 1000),
+                "body": f"{type(e).__name__}: {str(e)[:100]}",
+            }
+
+        # ── Test 2: Server time (no auth) ──
+        t2_start = time.time()
+        try:
+            r = requests.get(f"{BINANCE_BASE}/api/v3/time", timeout=10)
+            results["test2"] = {
+                "name": "Server time (لا auth)",
+                "ok":   r.status_code == 200,
+                "status": r.status_code,
+                "elapsed_ms": int((time.time() - t2_start) * 1000),
+                "body": (r.text or "")[:100],
+            }
+        except Exception as e:
+            results["test2"] = {
+                "name": "Server time (لا auth)",
+                "ok":   False,
+                "status": "EXCEPTION",
+                "elapsed_ms": int((time.time() - t2_start) * 1000),
+                "body": f"{type(e).__name__}: {str(e)[:100]}",
+            }
+
+        # ── Test 3: API key validity (signed but light) ──
+        t3_start = time.time()
+        if not BINANCE_API_KEY or not BINANCE_SECRET:
+            results["test3"] = {
+                "name": "API key validity",
+                "ok": False,
+                "status": "MISSING",
+                "elapsed_ms": 0,
+                "body": "API_KEY أو SECRET مفقود في environment",
+            }
+        else:
+            try:
+                params = {
+                    "timestamp": int(time.time() * 1000),
+                    "recvWindow": 60000,
+                }
+                query_string = urlencode(params)
+                signature = hmac.new(
+                    BINANCE_SECRET.encode("utf-8"),
+                    query_string.encode("utf-8"),
+                    hashlib.sha256
+                ).hexdigest()
+                params["signature"] = signature
+
+                r = requests.get(
+                    f"{BINANCE_BASE}/api/v3/account",
+                    params=params,
+                    headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+                    timeout=15,
+                )
+                results["test3"] = {
+                    "name": "Account endpoint (signed)",
+                    "ok":   r.status_code == 200,
+                    "status": r.status_code,
+                    "elapsed_ms": int((time.time() - t3_start) * 1000),
+                    "body": (r.text or "")[:200],
+                }
+            except Exception as e:
+                results["test3"] = {
+                    "name": "Account endpoint (signed)",
+                    "ok":   False,
+                    "status": "EXCEPTION",
+                    "elapsed_ms": int((time.time() - t3_start) * 1000),
+                    "body": f"{type(e).__name__}: {str(e)[:100]}",
+                }
+
+        # ── Test 4: Detect Railway IP (informational) ──
+        t4_start = time.time()
+        try:
+            r = requests.get("https://api.ipify.org?format=json", timeout=10)
+            ip_info = r.json() if r.status_code == 200 else {}
+            results["test4"] = {
+                "name": "Railway IP",
+                "ok": r.status_code == 200,
+                "status": r.status_code,
+                "elapsed_ms": int((time.time() - t4_start) * 1000),
+                "body": ip_info.get("ip", "?"),
+            }
+        except Exception as e:
+            results["test4"] = {
+                "name": "Railway IP",
+                "ok": False,
+                "status": "EXCEPTION",
+                "elapsed_ms": int((time.time() - t4_start) * 1000),
+                "body": f"{type(e).__name__}",
+            }
+
+        return results
+
+    results = await loop.run_in_executor(None, _run_tests)
+
+    # Build report
+    key_len = len(BINANCE_API_KEY) if BINANCE_API_KEY else 0
+    secret_len = len(BINANCE_SECRET) if BINANCE_SECRET else 0
+    key_preview = (f"{BINANCE_API_KEY[:6]}...{BINANCE_API_KEY[-4:]}"
+                   if key_len > 10 else "(missing)")
+
+    lines = [
+        "🔬 *Binance Deep Diagnostic*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 API Key length: `{key_len}` chars",
+        f"🔑 Preview: `{key_preview}`",
+        f"🔐 Secret length: `{secret_len}` chars",
+        "",
+    ]
+
+    # Test 1: Public ping
+    t1 = results["test1"]
+    icon = "✅" if t1["ok"] else "❌"
+    lines.append(f"{icon} *1. {t1['name']}*")
+    lines.append(f"   Status: `{t1['status']}` ({t1['elapsed_ms']}ms)")
+    if not t1["ok"]:
+        lines.append(f"   _{t1['body'][:80]}_")
+    lines.append("")
+
+    # Test 2: Server time
+    t2 = results["test2"]
+    icon = "✅" if t2["ok"] else "❌"
+    lines.append(f"{icon} *2. {t2['name']}*")
+    lines.append(f"   Status: `{t2['status']}` ({t2['elapsed_ms']}ms)")
+    lines.append("")
+
+    # Test 3: Account (auth)
+    t3 = results["test3"]
+    icon = "✅" if t3["ok"] else "❌"
+    lines.append(f"{icon} *3. {t3['name']}*")
+    lines.append(f"   Status: `{t3['status']}` ({t3['elapsed_ms']}ms)")
+    if not t3["ok"]:
+        body_clean = t3["body"][:160].replace("`", "'")
+        lines.append(f"   _{body_clean}_")
+    lines.append("")
+
+    # Test 4: Railway IP
+    t4 = results["test4"]
+    icon = "✅" if t4["ok"] else "❌"
+    lines.append(f"{icon} *4. {t4['name']}*")
+    if t4["ok"]:
+        lines.append(f"   `{t4['body']}` — هذا الـ IP يحتاج whitelist لو مفعّل")
+    lines.append("")
+
+    # ── Smart Diagnosis ──
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🩺 *التشخيص:*")
+
+    if not t1["ok"] and not t2["ok"]:
+        lines.append("🚫 Binance API غير متاح من Railway region.")
+        lines.append("   حلّ: غيّر region لـ `europe-west4`")
+    elif t1["ok"] and t2["ok"] and not t3["ok"]:
+        # Public works, signed fails — auth issue
+        body = t3.get("body", "").lower()
+        status = str(t3.get("status", ""))
+
+        if "-2014" in body or "api-key format invalid" in body:
+            lines.append("🔑 *Invalid API Key Format* — الـ key نفسه غلط.")
+            lines.append("   حلّ: تحقّق من نسخ BINANCE_API_KEY في Railway.")
+        elif "-2015" in body or "invalid api-key, ip, or permissions" in body:
+            lines.append("🌐 *IP whitelist مفعّل* أو الـ key/permissions غلط.")
+            ip = t4.get("body", "?")
+            lines.append(f"   IP الحالي: `{ip}`")
+            lines.append("   3 حلول:")
+            lines.append(f"   1. أضف `{ip}` للـ whitelist في Binance")
+            lines.append("   2. غيّر API لـ Unrestricted (مع Read-Only آمن)")
+            lines.append("   3. تحقّق إن صلاحية Reading مفعّلة")
+        elif "-1022" in body or "signature for this request is not valid" in body:
+            lines.append("🔐 *Signature غلط* — مشكلة في BINANCE_SECRET.")
+            lines.append("   حلّ: تحقّق من نسخ BINANCE_SECRET في Railway.")
+        elif "-1021" in body or "timestamp" in body:
+            lines.append("⏰ *Timestamp مشكلة* — recvWindow ضيق.")
+            lines.append("   حلّ: المشكلة قد تكون مؤقتة. حاول مرة أخرى.")
+        elif status == "418" or status == "429":
+            lines.append("⏱ *Rate limit أو IP banned*.")
+            lines.append("   حلّ: انتظر ساعة وحاول مرة أخرى.")
+        elif status == "451":
+            lines.append("🚫 *Geo-blocked* — Region غير مسموح.")
+            lines.append("   حلّ: تأكد Railway region = `europe-west4`")
+        else:
+            lines.append(f"❓ خطأ غير معروف. Status: `{status}`")
+            lines.append(f"   Body: `{t3['body'][:120]}`")
+    elif t1["ok"] and t2["ok"] and t3["ok"]:
+        lines.append("✅ كل شي يعمل! جرّب `/test` و `محفظتي`")
+    else:
+        lines.append("❓ نمط غير متوقّع. أرسل screenshot كامل.")
+
+    await msg.delete()
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def handle_msg(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.text:
         return
@@ -1063,6 +1279,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("test", cmd_test))
+    app.add_handler(CommandHandler("bindebug", cmd_bindebug))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_msg
     ))
